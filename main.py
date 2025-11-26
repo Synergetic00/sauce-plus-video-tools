@@ -1,21 +1,26 @@
 import os
+from pathlib import Path
 import re
+import subprocess
 import dotenv
 import gspread
 import asyncio
 import aiohttp
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from google.oauth2.service_account import Credentials
+from googleapiclient.http import MediaFileUpload
 from googleapiclient.discovery import build
 import requests
+import yt_dlp
 
 import config
 
 session = requests.Session()
 dotenv.load_dotenv()
 api_key = config.YTAPI_KEY
-scopes = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive.readonly']
+scopes = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
 creds = Credentials.from_service_account_file('credentials/sauce-plus-api.json', scopes=scopes)
+drive_service = build('drive', 'v3', credentials=creds)
 client = gspread.authorize(creds)
 sheets_id = '1y1E7CT-1TxGXdGpLFfioYDcOknlyuDs22fOOKcZmXvo'
 sheet = client.open_by_key(sheets_id)
@@ -191,11 +196,10 @@ def get_video_thumbnail_url(metadata):
     return None
 
 def get_files_in_folder(folder_id: str, creds) -> list[dict]:
-    service = build('drive', 'v3', credentials=creds)
     files = []
     page_token = None
     while True:
-        results = service.files().list(
+        results = drive_service.files().list(
             q=f"'{folder_id}' in parents and trashed=false",
             pageSize=100,
             fields="nextPageToken, files(id, name, mimeType, createdTime, modifiedTime, size, webViewLink)",
@@ -222,8 +226,16 @@ def extract_creator_index() -> tuple[dict, list[str]]:
     set_sheet_index(sheet, index)
     return index, creator_keys
 
-def index_videos(index: dict, key: str):
+def check_uploaded_videos(index: dict, key: str, video_ids: list[str], video_index: dict):
     mp4_files = get_list_of_mp4_files(index[key]['video_drive_link'], creds)
+    for idx, yt_id in enumerate(reversed(video_ids)):
+        internal_id = f'{key}_{str(idx+1).zfill(5)}'
+        video_data: dict = video_index.setdefault(yt_id, {})
+        video_data['internal_id'] = internal_id
+        if internal_id in mp4_files:
+            video_data['status'] = 'uploaded'
+
+def index_videos(index: dict, key: str):
     creator_sheet = sheet.worksheet(key)
     headers = ['YouTube ID', 'Internal ID', 'Status', 'Title', 'Publish Date', 'Duration', 'Description', 'Ad Timestamps', 'Thumbnail', 'Tags', 'Views', 'Likes', 'Comments']
     creator_sheet.update([headers], 'A1')
@@ -246,12 +258,7 @@ def index_videos(index: dict, key: str):
         video_data['comments'] = record['Comments'] or None
     missing_ids = [id for id in video_ids if id not in video_index.keys()]
     video_metadata = get_video_metadata(video_ids, api_key)
-    for idx, yt_id in enumerate(reversed(video_ids)):
-        internal_id = f'{key}_{str(idx+1).zfill(5)}'
-        video_data: dict = video_index.setdefault(yt_id, {})
-        video_data['internal_id'] = internal_id
-        if internal_id in mp4_files:
-            video_data['status'] = 'uploaded'
+    check_uploaded_videos(index, key, video_ids, video_index)
     sponsorblock_results = asyncio.run(fetch_all_sponsorblock_data(missing_ids))
     for yt_id in missing_ids:
         video_data: dict = video_index.setdefault(yt_id, {})
@@ -290,10 +297,24 @@ def index_videos(index: dict, key: str):
     creator_sheet.clear()
     creator_sheet.update(rows, 'A1')
 
-def download_video(yt_id: str, internal_id: str):
+def download_video(video_id: str, internal_id: str) -> bool:
     os.makedirs('downloaded', exist_ok=True)
     output_path = f"downloaded/{internal_id}.mp4"
-    pass
+    if os.path.exists(output_path):
+        return True
+    ydl_opts = {
+        'cookiefile': 'credentials/youtube_cookies.txt',
+        'quiet': True,
+        'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+        'outtmpl': output_path,
+        'merge_output_format': 'mp4',
+    }
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([f'https://www.youtube.com/watch?v={video_id}'])
+        return True
+    except Exception as e:
+        return False
 
 def download_videos(key: str):
     creator_sheet = sheet.worksheet(key)
@@ -306,8 +327,83 @@ def download_videos(key: str):
     for yt_id, internal_id in videos_to_download:
         download_video(yt_id, internal_id)
 
+def get_codecs(input_path: str) -> tuple[str, str]:
+    def probe(stream_type: str) -> str:
+        result = subprocess.run(
+            ['ffprobe', '-v', 'error',
+             '-select_streams', f'{stream_type}:0',
+             '-show_entries', 'stream=codec_name',
+             '-of', 'default=nw=1:nk=1',
+             input_path],
+            capture_output=True, text=True
+        )
+        return result.stdout.strip()
+    video_codec = probe('v')
+    audio_codec = probe('a')
+    return video_codec, audio_codec
+
+def reencode_video(input_path: str, output_path: str) -> bool:
+    try:
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        video_codec, audio_codec = get_codecs(input_path)
+        if video_codec == 'h264' and (audio_codec == 'aac' or audio_codec == ''):
+            subprocess.run([
+                'ffmpeg', '-y',
+                '-i', input_path,
+                '-c', 'copy',
+                output_path
+            ], check=True, capture_output=True)
+        else:
+            subprocess.run([
+                'ffmpeg', '-y',
+                '-i', input_path,
+                '-c:v', 'libx264',
+                '-preset', 'fast',
+                '-crf', '23',
+                '-c:a', 'aac',
+                '-b:a', '128k',
+                output_path
+            ], check=True, capture_output=True)
+        return True
+    except:
+        return False
+
+def encode_videos():
+    downloaded_path = Path('downloaded')
+    encoded_path = Path('encoded')
+    if not downloaded_path.exists():
+        return
+    video_files = list(downloaded_path.glob('**/*.mp4'))
+    if not video_files:
+        return
+    for input_file in video_files:
+        relative_path = input_file.relative_to(downloaded_path)
+        output_file = encoded_path / relative_path
+        if output_file.exists():
+            continue
+        reencode_video(str(input_file), str(output_file))
+
+def upload_file(folder_id: str, internal_id: str) -> str:
+    file_name = f"{internal_id}.mp4"
+    file_path = f"encoded/{file_name}"
+    file_metadata = {
+        'name': file_name,
+        'parents': [folder_id]
+    }
+    media = MediaFileUpload(file_path, mimetype='video/mp4', resumable=True)
+    file = drive_service.files().create(
+        body=file_metadata,
+        media_body=media,
+        fields='id',
+        supportsAllDrives=True
+    ).execute()
+    return file.get('id')
+
 if __name__ == '__main__':
-    index, creator_keys = extract_creator_index()
-    for key in creator_keys:
-        # index_videos(index, key)
-        download_videos(key)
+    download_video('N0VFuy-OC4o', 'ALNP_00113')
+    encode_videos()
+    print(upload_file('18Ff1kTAtibzcSwR4YAtmGmjruMTn4zM9', 'ALNP_00113'))
+    # index, creator_keys = extract_creator_index()
+    # for key in creator_keys:
+    #     # index_videos(index, key)
+    #     download_videos(key)
