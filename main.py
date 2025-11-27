@@ -178,6 +178,8 @@ def get_video_metadata(video_ids, api_key):
     return output
 
 def duration_to_seconds(duration_str):
+    if duration_str == 'P0D':
+        return 'N/A'
     pattern = r'PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?'
     match = re.match(pattern, duration_str)
     if not match:
@@ -267,14 +269,17 @@ def index_videos(index: dict, key: str):
         video_data['status'] = 'indexed'
         video_data['title'] = metadata['snippet']['title']
         video_data['publish_date'] = metadata['snippet']['publishedAt']
-        video_data['duration'] = duration_to_seconds(metadata['contentDetails']['duration'])
+        duration = duration_to_seconds(metadata['contentDetails']['duration'])
+        video_data['duration'] = duration
+        if duration == 'N/A':
+            video_data['status'] = 'invalid'
         video_data['description'] = metadata['snippet']['description']
         video_data['ad_timestamps'] = ', '.join(sponsorblock_data)
         video_data['thumbnail'] = get_video_thumbnail_url(metadata)
         video_data['tags'] = str(metadata['snippet'].get('tags', []))
-        video_data['views'] = metadata['statistics']['viewCount']
-        video_data['likes'] = metadata['statistics'].get('likeCount', 'N/A')
-        video_data['comments'] = metadata['statistics'].get('commentCount', 'N/A')
+        video_data['views'] = metadata['statistics'].get('viewCount', '0')
+        video_data['likes'] = metadata['statistics'].get('likeCount', '0')
+        video_data['comments'] = metadata['statistics'].get('commentCount', '0')
     rows = [headers]
     for yt_id in video_ids:
         video_data = video_index.get(yt_id, {})
@@ -386,6 +391,8 @@ def encode_videos():
 def upload_file(folder_id: str, internal_id: str) -> str:
     file_name = f"{internal_id}.mp4"
     file_path = f"encoded/{file_name}"
+    if not os.path.exists(file_path):
+        return 'N/A'
     file_metadata = {
         'name': file_name,
         'parents': [folder_id]
@@ -399,11 +406,57 @@ def upload_file(folder_id: str, internal_id: str) -> str:
     ).execute()
     return file.get('id')
 
+def upload_videos(key: str):
+    creator_sheet = sheet.worksheet(key)
+    records = creator_sheet.get_all_records()
+    folder_id = index[key]['video_drive_link']
+    videos_to_upload = [
+        (record['Internal ID'])
+        for record in records
+        if record['Status'] == 'indexed' and record['Internal ID']
+    ]
+    for internal_id in videos_to_upload:
+        upload_file(folder_id, internal_id)
+
+def update_sheet_info():
+    for key in creator_keys:
+        creator_sheet = sheet.worksheet(key)
+        records = creator_sheet.get_all_records()
+        video_index = {}
+        for record in records:
+            video_data = video_index.setdefault(record['YouTube ID'], {})
+            video_data['internal_id'] = record['Internal ID'] or None
+            video_data['status'] = record['Status'] or None
+        video_ids = list(video_index.keys())
+        check_uploaded_videos(index, key, video_ids, video_index)
+        rows = [['YouTube ID', 'Internal ID', 'Status', 'Title', 'Publish Date', 'Duration', 'Description', 'Ad Timestamps', 'Thumbnail', 'Tags', 'Views', 'Likes', 'Comments']]
+        for record in records:
+            yt_id = record['YouTube ID']
+            row = [
+                yt_id,
+                video_index[yt_id].get('internal_id', record['Internal ID']),
+                video_index[yt_id].get('status', record['Status']),
+                record['Title'],
+                record['Publish Date'],
+                record['Duration'],
+                record['Description'],
+                record['Ad Timestamps'],
+                record['Thumbnail'],
+                record['Tags'],
+                record['Views'],
+                record['Likes'],
+                record['Comments']
+            ]
+            rows.append(row)
+        creator_sheet.clear()
+        creator_sheet.update(rows, 'A1')
+
 if __name__ == '__main__':
-    download_video('N0VFuy-OC4o', 'ALNP_00113')
+    index, creator_keys = extract_creator_index()
+    for key in creator_keys:
+        index_videos(index, key)
+        download_videos(key)
     encode_videos()
-    print(upload_file('18Ff1kTAtibzcSwR4YAtmGmjruMTn4zM9', 'ALNP_00113'))
-    # index, creator_keys = extract_creator_index()
-    # for key in creator_keys:
-    #     # index_videos(index, key)
-    #     download_videos(key)
+    for key in creator_keys:
+        upload_videos(key)
+        update_sheet_info()
