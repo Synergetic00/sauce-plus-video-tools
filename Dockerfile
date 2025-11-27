@@ -9,6 +9,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-VOLUME ["/app/downloads", "/app/encoded", "/app/credentials"]
+VOLUME ["/app/credentials", "/app/downloads", "/app/encoded", "/app/thumbnails"]
 
-CMD ["python", "main.py"]
+CMD ["python", "-u", "main.py"]

@@ -32,7 +32,8 @@ def get_sheet_index(sheet: gspread.Spreadsheet):
     for record in records:
         creator_info: dict = index.setdefault(record['Key'], {})
         creator_info['handle'] = record['Handle'] or None
-        creator_info['video_drive_link'] = record['Video Drive Link'] or None
+        creator_info['video_drive_id'] = record['Video Drive ID'] or None
+        creator_info['thumbnail_drive_id'] = record['Thumbnail Drive ID'] or None
         creator_info['channel_id'] = record['Channel ID'] or None
         creator_info['title'] = record['Title'] or None
         creator_info['created'] = record['Created'] or None
@@ -98,13 +99,14 @@ def update_creator_index(key: str, index: dict):
 
 def set_sheet_index(sheet: gspread.Spreadsheet, index: dict[str, dict]):
     index_sheet = sheet.worksheet('Index')
-    headers = ['Key', 'Handle', 'Video Drive Link', 'Channel ID', 'Title', 'Created', 'Description', 'Country', 'Keywords', 'Icon', 'Banner', 'Uploads ID']
+    headers = ['Key', 'Handle', 'Video Drive ID', 'Thumbnail Drive ID', 'Channel ID', 'Title', 'Created', 'Description', 'Country', 'Keywords', 'Icon', 'Banner', 'Uploads ID']
     rows = [headers]
     for key, creator_info in index.items():
         row = [
             key,
             creator_info.get('handle', ''),
-            creator_info.get('video_drive_link', ''),
+            creator_info.get('video_drive_id', ''),
+            creator_info.get('thumbnail_drive_id', ''),
             creator_info.get('channel_id', ''),
             creator_info.get('title', ''),
             creator_info.get('created', ''),
@@ -197,7 +199,7 @@ def get_video_thumbnail_url(metadata):
             return thumbnails[quality]['url']
     return None
 
-def get_files_in_folder(folder_id: str, creds) -> list[dict]:
+def get_files_in_folder(folder_id: str) -> list[dict]:
     files = []
     page_token = None
     while True:
@@ -210,13 +212,13 @@ def get_files_in_folder(folder_id: str, creds) -> list[dict]:
             pageToken=page_token
         ).execute()
         files.extend(results.get('files', []))
-        page_token = results.get('nextPageToken')
+        page_token = results.get('nextPageToken', False)
         if not page_token:
             break
     return files
 
-def get_list_of_mp4_files(folder_id: str, creds) -> list[str]:
-    files = get_files_in_folder(folder_id, creds)
+def get_list_of_mp4_files(folder_id: str) -> list[str]:
+    files = get_files_in_folder(folder_id)
     return [str(file['name']).removesuffix('.mp4') for file in files if file['mimeType'] == 'video/mp4']
 
 def extract_creator_index() -> tuple[dict, list[str]]:
@@ -229,7 +231,7 @@ def extract_creator_index() -> tuple[dict, list[str]]:
     return index, creator_keys
 
 def check_uploaded_videos(index: dict, key: str, video_ids: list[str], video_index: dict):
-    mp4_files = get_list_of_mp4_files(index[key]['video_drive_link'], creds)
+    mp4_files = get_list_of_mp4_files(index[key]['video_drive_id'])
     for idx, yt_id in enumerate(reversed(video_ids)):
         internal_id = f'{key}_{str(idx+1).zfill(5)}'
         video_data: dict = video_index.setdefault(yt_id, {})
@@ -388,16 +390,15 @@ def encode_videos():
             continue
         reencode_video(str(input_file), str(output_file))
 
-def upload_file(folder_id: str, internal_id: str) -> str:
-    file_name = f"{internal_id}.mp4"
-    file_path = f"encoded/{file_name}"
+def upload_file(folder_id: str, file_name: str, folder: str, mimetype: str) -> str:
+    file_path = f"{folder}/{file_name}"
     if not os.path.exists(file_path):
         return 'N/A'
     file_metadata = {
         'name': file_name,
         'parents': [folder_id]
     }
-    media = MediaFileUpload(file_path, mimetype='video/mp4', resumable=True)
+    media = MediaFileUpload(file_path, mimetype=mimetype, resumable=True)
     file = drive_service.files().create(
         body=file_metadata,
         media_body=media,
@@ -409,14 +410,14 @@ def upload_file(folder_id: str, internal_id: str) -> str:
 def upload_videos(key: str):
     creator_sheet = sheet.worksheet(key)
     records = creator_sheet.get_all_records()
-    folder_id = index[key]['video_drive_link']
+    folder_id = index[key]['video_drive_id']
     videos_to_upload = [
         (record['Internal ID'])
         for record in records
         if record['Status'] == 'indexed' and record['Internal ID']
     ]
     for internal_id in videos_to_upload:
-        upload_file(folder_id, internal_id)
+        upload_file(folder_id, f"{internal_id}.mp4", 'encoded', 'video/mp4')
 
 def update_sheet_info():
     for key in creator_keys:
@@ -451,12 +452,35 @@ def update_sheet_info():
         creator_sheet.clear()
         creator_sheet.update(rows, 'A1')
 
+def upload_thumbnails(index: dict, key: str):
+    folder_id = index[key]['thumbnail_drive_id']
+    files = get_files_in_folder(folder_id)
+    existing_ids = [str(file['name']).removesuffix('_TN.jpg') for file in files if file['mimeType'] == 'image/jpeg']
+    creator_sheet = sheet.worksheet(key)
+    records = creator_sheet.get_all_records()
+    for record in records:
+        internal_id = record['Internal ID']
+        if not internal_id in existing_ids:
+            file_path = f'thumbnails/{internal_id}_TN.jpg'
+            if not os.path.exists(file_path):
+                resp = requests.get(record['Thumbnail'])
+                with open(file_path, 'wb') as out_file:
+                    out_file.write(resp.content)
+            resp = upload_file(folder_id, f"{internal_id}_TN.jpg", 'thumbnails', 'image/jpeg')
+            print(resp)
+
 if __name__ == '__main__':
+    print('Started')
     index, creator_keys = extract_creator_index()
     for key in creator_keys:
         index_videos(index, key)
+        print(f'Indexed: {key}')
         download_videos(key)
+        print(f'Downloaded: {key}')
     encode_videos()
+    print(f'Encoded')
     for key in creator_keys:
         upload_videos(key)
         update_sheet_info()
+        upload_thumbnails(index, key)
+        print(f'Uploaded: {key}')

@@ -1,6 +1,7 @@
 /credentials/
 /downloaded/
 /encoded/
+/thumbnails/
 __pycache__/
 .env
 .DS_Store
