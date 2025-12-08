@@ -33,6 +33,7 @@ def get_sheet_index(sheet: gspread.Spreadsheet):
         creator_info: dict = index.setdefault(record['Key'], {})
         creator_info['handle'] = record['Handle'] or None
         creator_info['video_drive_id'] = record['Video Drive ID'] or None
+        creator_info['archive_videos'] = record.get('Archive Videos', '').upper() == 'TRUE'
         creator_info['thumbnail_drive_id'] = record['Thumbnail Drive ID'] or None
         creator_info['channel_id'] = record['Channel ID'] or None
         creator_info['title'] = record['Title'] or None
@@ -99,12 +100,13 @@ def update_creator_index(key: str, index: dict):
 
 def set_sheet_index(sheet: gspread.Spreadsheet, index: dict[str, dict]):
     index_sheet = sheet.worksheet('Index')
-    headers = ['Key', 'Handle', 'Video Drive ID', 'Thumbnail Drive ID', 'Channel ID', 'Title', 'Created', 'Description', 'Country', 'Keywords', 'Icon', 'Banner', 'Uploads ID']
+    headers = ['Key', 'Handle', 'Archive Videos', 'Video Drive ID', 'Thumbnail Drive ID', 'Channel ID', 'Title', 'Created', 'Description', 'Country', 'Keywords', 'Icon', 'Banner', 'Uploads ID']
     rows = [headers]
     for key, creator_info in index.items():
         row = [
             key,
             creator_info.get('handle', ''),
+            creator_info.get('archive_videos', True),
             creator_info.get('video_drive_id', ''),
             creator_info.get('thumbnail_drive_id', ''),
             creator_info.get('channel_id', ''),
@@ -241,13 +243,14 @@ def check_uploaded_videos(index: dict, key: str, video_ids: list[str], video_ind
 
 def index_videos(index: dict, key: str):
     creator_sheet = sheet.worksheet(key)
-    headers = ['YouTube ID', 'Internal ID', 'Status', 'Title', 'Publish Date', 'Duration', 'Description', 'Ad Timestamps', 'Thumbnail', 'Tags', 'Views', 'Likes', 'Comments']
+    headers = ['YouTube ID', 'YouTube Link', 'Internal ID', 'Status', 'Title', 'Publish Date', 'Duration', 'Description', 'Ad Timestamps', 'Thumbnail', 'Tags', 'Views', 'Likes', 'Comments']
     creator_sheet.update([headers], 'A1')
     video_ids = get_video_ids(index[key]['uploads_id'], api_key)
     records = creator_sheet.get_all_records()
     video_index = {}
     for record in records:
         video_data: dict = video_index.setdefault(record['YouTube ID'], {})
+        video_data['youtube_link'] = record['YouTube Link'] or None
         video_data['internal_id'] = record['Internal ID'] or None
         video_data['status'] = record['Status'] or None
         video_data['title'] = record['Title'] or None
@@ -287,6 +290,7 @@ def index_videos(index: dict, key: str):
         video_data = video_index.get(yt_id, {})
         row = [
             yt_id,
+            f"https://www.youtube.com/watch?v={yt_id}",
             video_data.get('internal_id', ''),
             video_data.get('status', ''),
             video_data.get('title', ''),
@@ -326,10 +330,41 @@ def download_video(video_id: str, internal_id: str) -> bool:
 def download_videos(key: str):
     creator_sheet = sheet.worksheet(key)
     records = creator_sheet.get_all_records()
+    video_ids = [r['YouTube ID'] for r in records]
+    video_index = {}
+    for record in records:
+        video_data = video_index.setdefault(record['YouTube ID'], {})
+        video_data['internal_id'] = record['Internal ID']
+        video_data['status'] = record['Status']
+    check_uploaded_videos(index, key, video_ids, video_index)
+    headers = ['YouTube ID', 'YouTube Link', 'Internal ID', 'Status', 'Title', 'Publish Date', 'Duration', 'Description', 'Ad Timestamps', 'Thumbnail', 'Tags', 'Views', 'Likes', 'Comments']
+    rows = [headers]
+    for record in records:
+        yt_id = record['YouTube ID']
+        row = [
+            yt_id,
+            f"https://www.youtube.com/watch?v={yt_id}",
+            record['Internal ID'],
+            video_index.get(yt_id, {}).get('status', record['Status']),  # Use updated status
+            record['Title'],
+            record['Publish Date'],
+            record['Duration'],
+            record['Description'],
+            record['Ad Timestamps'],
+            record['Thumbnail'],
+            record['Tags'],
+            record['Views'],
+            record['Likes'],
+            record['Comments']
+        ]
+        rows.append(row)
+    creator_sheet.clear()
+    creator_sheet.update(rows, 'A1')
     videos_to_download = [
         (record['YouTube ID'], record['Internal ID'])
         for record in records
-        if record['Status'] == 'indexed' and record['YouTube ID'] and record['Internal ID']
+        if video_index.get(record['YouTube ID'], {}).get('status') == 'indexed'
+        and record['YouTube ID'] and record['Internal ID']
     ]
     for yt_id, internal_id in videos_to_download:
         download_video(yt_id, internal_id)
@@ -407,6 +442,21 @@ def upload_file(folder_id: str, file_name: str, folder: str, mimetype: str) -> s
     ).execute()
     return file.get('id')
 
+def send_discord_notification(webhook_url: str, file_id: str, internal_id: str):
+    drive_link = f"https://drive.google.com/file/d/{file_id}/view"
+    embed = {
+        "description": f"Video uploaded: [{internal_id}]({drive_link})",
+        "color": 5814783
+    }
+    payload = { "embeds": [embed] }
+    try:
+        response = requests.post(webhook_url, json=payload)
+        response.raise_for_status()
+        return True
+    except Exception as e:
+        print(f"Failed to send Discord notification: {e}")
+        return False
+
 def upload_videos(key: str):
     creator_sheet = sheet.worksheet(key)
     records = creator_sheet.get_all_records()
@@ -417,7 +467,9 @@ def upload_videos(key: str):
         if record['Status'] == 'indexed' and record['Internal ID']
     ]
     for internal_id in videos_to_upload:
-        upload_file(folder_id, f"{internal_id}.mp4", 'encoded', 'video/mp4')
+        file_id = upload_file(folder_id, f"{internal_id}.mp4", 'encoded', 'video/mp4')
+        if file_id != 'N/A' and config.DISCORD_WEBHOOK_URL:
+            send_discord_notification(config.DISCORD_WEBHOOK_URL, file_id, internal_id)
 
 def update_sheet_info():
     for key in creator_keys:
@@ -430,11 +482,12 @@ def update_sheet_info():
             video_data['status'] = record['Status'] or None
         video_ids = list(video_index.keys())
         check_uploaded_videos(index, key, video_ids, video_index)
-        rows = [['YouTube ID', 'Internal ID', 'Status', 'Title', 'Publish Date', 'Duration', 'Description', 'Ad Timestamps', 'Thumbnail', 'Tags', 'Views', 'Likes', 'Comments']]
+        rows = [['YouTube ID', 'YouTube Link', 'Internal ID', 'Status', 'Title', 'Publish Date', 'Duration', 'Description', 'Ad Timestamps', 'Thumbnail', 'Tags', 'Views', 'Likes', 'Comments']]
         for record in records:
             yt_id = record['YouTube ID']
             row = [
                 yt_id,
+                f"https://www.youtube.com/watch?v={yt_id}",
                 video_index[yt_id].get('internal_id', record['Internal ID']),
                 video_index[yt_id].get('status', record['Status']),
                 record['Title'],
@@ -460,6 +513,8 @@ def upload_thumbnails(index: dict, key: str):
     records = creator_sheet.get_all_records()
     for record in records:
         internal_id = record['Internal ID']
+        if record['Status'] == 'invalid':
+            continue
         if not internal_id in existing_ids:
             file_path = f'thumbnails/{internal_id}_TN.jpg'
             if not os.path.exists(file_path):
@@ -474,9 +529,13 @@ if __name__ == '__main__':
     index, creator_keys = extract_creator_index()
     for key in creator_keys:
         index_videos(index, key)
+        index.get('archive_videos', True)
         print(f'Indexed: {key}')
-        download_videos(key)
-        print(f'Downloaded: {key}')
+        if index[key].get('archive_videos', True):
+            download_videos(key)
+            print(f'Downloaded: {key}')
+        else:
+            print(f'Skipped download: {key} (archive_videos is False)')
     encode_videos()
     print(f'Encoded')
     for key in creator_keys:
