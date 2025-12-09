@@ -12,16 +12,46 @@ from googleapiclient.http import MediaFileUpload
 from googleapiclient.discovery import build
 import requests
 import yt_dlp
+import time
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 import config
 
-session = requests.Session()
+def create_session_with_retries():
+    session = requests.Session()
+    retry_strategy = Retry(
+        total=5,
+        backoff_factor=1,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["HEAD", "GET", "OPTIONS", "POST", "PUT"]
+    )
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
+
+session = create_session_with_retries()
 dotenv.load_dotenv()
 api_key = config.YTAPI_KEY
 scopes = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
 creds = Credentials.from_service_account_file('credentials/sauce-plus-api.json', scopes=scopes)
 drive_service = build('drive', 'v3', credentials=creds)
-client = gspread.authorize(creds)
+
+def authorize_gspread_with_retry(creds, max_retries=3):
+    for attempt in range(max_retries):
+        try:
+            client = gspread.authorize(creds)
+            return client
+        except Exception as e:
+            if attempt < max_retries - 1:
+                wait_time = 2 ** attempt
+                print(f"gspread authorization failed, retrying in {wait_time}s... ({e})")
+                time.sleep(wait_time)
+            else:
+                raise
+
+client = authorize_gspread_with_retry(creds)
 sheets_id = '1y1E7CT-1TxGXdGpLFfioYDcOknlyuDs22fOOKcZmXvo'
 sheet = client.open_by_key(sheets_id)
 
@@ -345,7 +375,7 @@ def download_videos(key: str):
             yt_id,
             f"https://www.youtube.com/watch?v={yt_id}",
             record['Internal ID'],
-            video_index.get(yt_id, {}).get('status', record['Status']),  # Use updated status
+            video_index.get(yt_id, {}).get('status', record['Status']),
             record['Title'],
             record['Publish Date'],
             record['Duration'],
@@ -471,17 +501,40 @@ def upload_videos(key: str):
         if file_id != 'N/A' and config.DISCORD_WEBHOOK_URL:
             send_discord_notification(config.DISCORD_WEBHOOK_URL, file_id, internal_id)
 
-def update_sheet_info():
-    for key in creator_keys:
-        creator_sheet = sheet.worksheet(key)
-        records = creator_sheet.get_all_records()
+def gspread_retry(func, max_retries=3, *args, **kwargs):
+    for attempt in range(max_retries):
+        try:
+            return func(*args, **kwargs)
+        except (requests.exceptions.ConnectionError,
+                requests.exceptions.Timeout,
+                gspread.exceptions.APIError) as e:
+            if attempt < max_retries - 1:
+                wait_time = 2 ** attempt
+                print(f"gspread call failed, retrying in {wait_time}s... ({e})")
+                time.sleep(wait_time)
+            else:
+                print(f"gspread call failed after {max_retries} attempts")
+                raise
+
+def update_sheet_info(key: str):
+    """Update sheet info for a specific creator key"""
+    try:
+        creator_sheet = gspread_retry(sheet.worksheet, 3, key)
+        records = gspread_retry(creator_sheet.get_all_records, 3)
+
         video_index = {}
         for record in records:
             video_data = video_index.setdefault(record['YouTube ID'], {})
             video_data['internal_id'] = record['Internal ID'] or None
             video_data['status'] = record['Status'] or None
+
         video_ids = list(video_index.keys())
+
+
+        time.sleep(0.5)
+
         check_uploaded_videos(index, key, video_ids, video_index)
+
         rows = [['YouTube ID', 'YouTube Link', 'Internal ID', 'Status', 'Title', 'Publish Date', 'Duration', 'Description', 'Ad Timestamps', 'Thumbnail', 'Tags', 'Views', 'Likes', 'Comments']]
         for record in records:
             yt_id = record['YouTube ID']
@@ -502,8 +555,13 @@ def update_sheet_info():
                 record['Comments']
             ]
             rows.append(row)
-        creator_sheet.clear()
-        creator_sheet.update(rows, 'A1')
+
+        gspread_retry(creator_sheet.clear, 3)
+        gspread_retry(creator_sheet.update, 3, rows, 'A1')
+
+    except Exception as e:
+        print(f"Error updating sheet info for {key}: {e}")
+        raise
 
 def upload_thumbnails(index: dict, key: str):
     folder_id = index[key]['thumbnail_drive_id']
@@ -528,18 +586,30 @@ if __name__ == '__main__':
     print('Started')
     index, creator_keys = extract_creator_index()
     for key in creator_keys:
-        index_videos(index, key)
-        index.get('archive_videos', True)
-        print(f'Indexed: {key}')
-        if index[key].get('archive_videos', True):
-            download_videos(key)
-            print(f'Downloaded: {key}')
-        else:
-            print(f'Skipped download: {key} (archive_videos is False)')
+        try:
+            index_videos(index, key)
+            index.get('archive_videos', True)
+            print(f'Indexed: {key}')
+
+            if index[key].get('archive_videos', True):
+                download_videos(key)
+                print(f'Downloaded: {key}')
+            else:
+                print(f'Skipped download: {key} (archive_videos is False)')
+        except Exception as e:
+            print(f'Error processing {key}: {e}')
+            continue
+
     encode_videos()
     print(f'Encoded')
+
     for key in creator_keys:
-        upload_videos(key)
-        update_sheet_info()
-        upload_thumbnails(index, key)
-        print(f'Uploaded: {key}')
+        try:
+            upload_videos(key)
+            update_sheet_info(key)
+            time.sleep(1)
+            upload_thumbnails(index, key)
+            print(f'Uploaded: {key}')
+        except Exception as e:
+            print(f'Error uploading for {key}: {e}')
+            continue
