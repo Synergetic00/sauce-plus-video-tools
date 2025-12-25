@@ -267,8 +267,12 @@ def check_uploaded_videos(index: dict, key: str, video_ids: list[str], video_ind
     for idx, yt_id in enumerate(reversed(video_ids)):
         internal_id = f'{key}_{str(idx+1).zfill(5)}'
         video_data: dict = video_index.setdefault(yt_id, {})
-        video_data['internal_id'] = internal_id
-        if internal_id in mp4_files:
+        # Only assign Internal ID if the video doesn't already have one
+        if not video_data.get('internal_id'):
+            video_data['internal_id'] = internal_id
+        # Use the actual internal_id (existing or new) to check upload status
+        actual_internal_id = video_data['internal_id']
+        if actual_internal_id in mp4_files:
             video_data['status'] = 'uploaded'
 
 def index_videos(index: dict, key: str):
@@ -278,6 +282,8 @@ def index_videos(index: dict, key: str):
     video_ids = get_video_ids(index[key]['uploads_id'], api_key)
     records = creator_sheet.get_all_records()
     video_index = {}
+
+    # Load existing video data from sheet
     for record in records:
         video_data: dict = video_index.setdefault(record['YouTube ID'], {})
         video_data['youtube_link'] = record['YouTube Link'] or None
@@ -293,9 +299,23 @@ def index_videos(index: dict, key: str):
         video_data['views'] = record['Views'] or None
         video_data['likes'] = record['Likes'] or None
         video_data['comments'] = record['Comments'] or None
+
+    # Identify unlisted videos (in sheet but not in current video_ids)
+    unlisted_ids = [yt_id for yt_id in video_index.keys() if yt_id not in video_ids]
+
+    # Mark unlisted videos with updated status (but keep "uploaded" status if already uploaded)
+    for yt_id in unlisted_ids:
+        current_status = video_index[yt_id]['status']
+        if current_status not in ['uploaded', 'unlisted', 'invalid']:
+            video_index[yt_id]['status'] = 'unlisted'
+
     missing_ids = [id for id in video_ids if id not in video_index.keys()]
     video_metadata = get_video_metadata(video_ids, api_key)
-    check_uploaded_videos(index, key, video_ids, video_index)
+
+    # Combine video_ids with unlisted_ids for Internal ID assignment
+    all_video_ids = video_ids + unlisted_ids
+    check_uploaded_videos(index, key, all_video_ids, video_index)
+
     sponsorblock_results = asyncio.run(fetch_all_sponsorblock_data(missing_ids))
     for yt_id in missing_ids:
         video_data: dict = video_index.setdefault(yt_id, {})
@@ -315,8 +335,14 @@ def index_videos(index: dict, key: str):
         video_data['views'] = metadata['statistics'].get('viewCount', '0')
         video_data['likes'] = metadata['statistics'].get('likeCount', '0')
         video_data['comments'] = metadata['statistics'].get('commentCount', '0')
+
     rows = [headers]
-    for yt_id in video_ids:
+    # Sort all videos by Internal ID in descending order (newest first)
+    sorted_video_ids = sorted(all_video_ids,
+                              key=lambda yt_id: video_index.get(yt_id, {}).get('internal_id', ''),
+                              reverse=True)
+
+    for yt_id in sorted_video_ids:
         video_data = video_index.get(yt_id, {})
         row = [
             yt_id,
